@@ -135,6 +135,9 @@ elif [[ $LOGS_BACKEND == s3 ]]; then
     exit 1
   fi
 
+  lxc exec $NAME -- chown root.root /root/.s3cfg
+  lxc exec $NAME -- chmod 640 /root/.s3cfg
+
   # Backup script
   cat <<EOF > s3backup.sh
   #!/usr/bin/env bash
