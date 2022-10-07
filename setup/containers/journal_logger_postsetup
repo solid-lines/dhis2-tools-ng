@@ -1,21 +1,21 @@
 LOGS_DIR=$(echo $CONTAINER | jq -r .directory)
 LOGS_BACKEND=$(echo $CONTAINER | jq -r .storage)
 
-S3_STORAGE_CLASS="STANDARD_IA"
 CONTAINER_LOGS_DIR="/var/log/journal/remote"
 
 POOL_NAME="logs"
 VOLUME_NAME="logs"
 
 # Containers setup
-for CONTAINER in $CONTAINERS; do
-  container_name=$(echo $CONTAINER | jq -r .name)
-  container_type=$(echo $CONTAINER | jq -r .type)
+for container in $CONTAINERS; do
+  container_name=$(echo $container | jq -r .name)
+  container_type=$(echo $container | jq -r .type)
 
   # Skip configuration for logger and SIEM
   if ! [[ "$container_type" =~ "siem" ]] && ! [[ "$container_type" =~ "logger" ]]; then
     journal_remote_installed=$(lxc exec $container_name -- dpkg -l | grep -w systemd-journal-remote)
     if [ "$journal_remote_installed" ]; then
+      lxc exec $container_name -- service systemd-journal-upload restart # restart to force resync
       echo "[WARN] $container_name has already journal-remote installed. Skipped"
       continue
     fi
@@ -88,7 +88,76 @@ if [[ $LOGS_BACKEND == fs ]]; then
 
   #lxc exec $NAME -- sed -e "s/journal\/remote/${CONTAINER_LOGS_DIR//\//\\/}/g" /lib/systemd/system/systemd-journal-remote.service
 elif [[ $LOGS_BACKEND == s3 ]]; then
-  lxc exec $NAME -- apt install awscli -y
-  # configure awscli with profile
-  lxc exec $NAME -- crontab -l ; echo "0 * * * * s3 cp --quiet --sse --storage-class ${S3_STORAGE_CLASS} ${CONTAINER_LOGS_DIR} s3://${LOGS_DIR}" | sort - | uniq - | crontab -
+  echo "[*] Configuring S3 backend..."
+  # To get the latest version of s3cmd, use pip.
+  #lxc exec $NAME -- apt install python3-pip -y || exit 1
+  #lxc exec $NAME -- pip install s3cmd || exit 1
+  lxc exec $NAME -- apt install s3cmd -y || exit 1
+
+  S3CFG=$(echo $CONTAINER | jq -r '.config // empty')
+  S3_ACCESS_KEY=$(echo $CONTAINER | jq -r '.access_key // empty')
+  S3_SECRET_KEY=$(echo $CONTAINER | jq -r '.secret_key // empty')
+  S3_PROVIDER=$(echo $CONTAINER | jq -r '.provider // empty') # supports aws, contabo, digitalocean, gcp
+  S3_BUCKET_LOCATION=$(echo $CONTAINER | jq -r '.location // empty')
+
+  if ! [ "$S3_PROVIDER" ]; then
+    S3_PROVIDER="aws"
+  fi
+
+  if ! [ "$S3_BUCKET_LOCATION" ]; then
+    S3_BUCKET_LOCATION="EU"
+  fi
+
+  if [ "$S3CFG" ]; then
+    lxc file push $S3CFG $NAME/root/.s3cfg || exit 1
+  elif [ "$S3_ACCESS_KEY" ] && [ "$S3_SECRET_KEY" ]; then
+    lxc file push ./etc/s3cfg $NAME/root/.s3cfg || exit 1
+    lxc exec $NAME -- sed -i "s/S3_ACCESS_KEY/$S3_ACCESS_KEY/" /root/.s3cfg
+    lxc exec $NAME -- sed -i "s/S3_SECRET_KEY/$S3_SECRET_KEY/" /root/.s3cfg
+    lxc exec $NAME -- sed -i "s/BUCKET_LOCATION/$S3_BUCKET_LOCATION/" /root/.s3cfg
+
+    if [[ "$S3_PROVIDER" == "aws" ]]; then
+      lxc exec $NAME -- sed -i "s/HOST_BASE/s3.amazonaws.com/" /root/.s3cfg
+      lxc exec $NAME -- sed -i "s/HOST_BUCKET/%(bucket)s.s3.amazonaws.com/" /root/.s3cfg
+    elif [[ "$S3_PROVIDER" == "contabo" ]]; then
+      lxc exec $NAME -- sed -i "s/HOST_BASE/https\:\/\/eu2.contabostorage.com/" /root/.s3cfg
+      lxc exec $NAME -- sed -i "s/HOST_BUCKET/https\:\/\/eu2.contabostorage.com/" /root/.s3cfg
+    elif [[ "$S3_PROVIDER" == "digitalocean" ]]; then
+      lxc exec $NAME -- sed -i "s/HOST_BASE/nyc3.digitaloceanspaces.com/" /root/.s3cfg
+      lxc exec $NAME -- sed -i "s/HOST_BUCKET/%(bucket)s\.nyc3\.digitaloceanspaces\.com/" /root/.s3cfg
+    elif [[ "$S3_PROVIDER" == "gcp" ]]; then
+      lxc exec $NAME -- sed -i "s/HOST_BASE/storage.googleapis.com/" /root/.s3cfg
+      lxc exec $NAME -- sed -i "s/HOST_BUCKET/%(bucket).storage.googleapis.com" /root/.s3cfg
+    fi
+
+  else
+    echo "[X] For S3 backend config or access_key and secret_key must be specified. Quitting"
+    exit 1
+  fi
+
+  # Backup script
+  cat <<EOF > s3backup.sh
+  #!/usr/bin/env bash
+  echo "[\$(date +%FT%T%Z)] Backup started."
+
+  tmpd=\$(mktemp -d)/
+  s3cmd=\$(which s3cmd)
+
+  # We need to copy the files before uploading because the files change while uploading thus failing the checksum
+  echo "[\$(date +%FT%T%Z)] Copying files..."
+  cp -rv ${CONTAINER_LOGS_DIR}/* \$tmpd
+
+  echo "[\$(date +%FT%T%Z)] Upload started."
+  \$s3cmd sync --no-progress --server-side-encryption \$tmpd s3://${LOGS_DIR}
+
+  rm -rfv \$tmpd
+  echo "[\$(date +%FT%T%Z)] Backup finished."
+EOF
+
+  lxc file push s3backup.sh $NAME/usr/local/bin/
+  rm -rf s3backup.sh
+
+  lxc exec $NAME -- chmod +x /usr/local/bin/s3backup.sh
+  # Upload logs every 5 minutes
+  lxc exec $NAME -- sh -c "(crontab -l ; echo \"*/5 * * * * /usr/local/bin/s3backup.sh >> /var/log/s3backup.log 2>&1\") | sort | uniq | crontab -"
 fi
