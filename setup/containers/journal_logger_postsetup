@@ -128,6 +128,9 @@ elif [[ $LOGS_BACKEND == s3 ]]; then
     elif [[ "$S3_PROVIDER" == "gcp" ]]; then
       lxc exec $NAME -- sed -i "s/HOST_BASE/storage.googleapis.com/" /root/.s3cfg
       lxc exec $NAME -- sed -i "s/HOST_BUCKET/%(bucket).storage.googleapis.com" /root/.s3cfg
+    else
+      echo "[X] S3 provider not supported. Quitting"
+      exit 1
     fi
 
   else
